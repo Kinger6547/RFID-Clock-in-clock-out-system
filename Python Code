@@ -1,0 +1,621 @@
+# =============================================================================
+# RFID TIME TRACKING SYSTEM
+# =============================================================================
+# HOW TO RUN:
+#   1. Open Git Bash:
+#        cd /path/to/project
+#        source venv/Scripts/activate
+#        python rfid_kimai_all_in_one.py
+#   2. Open browser: http://localhost:5000
+#
+# HOW TO STOP:
+#   Press Ctrl+C in Git Bash
+# =============================================================================
+
+import datetime
+import gspread
+import csv
+import logging
+import time
+from google.oauth2.service_account import Credentials
+from flask import Flask, render_template_string, request, jsonify
+import threading
+
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+app = Flask(__name__)
+
+
+# =============================================================================
+# SEASON CONFIG
+# -----------------------------------------------------------------------------
+# Season runs Jan 10 - Dec 31. Resets every January 1st.
+# Change SEASON_START_MONTH and SEASON_START_DAY to adjust the season start.
+# =============================================================================
+
+SEASON_START_MONTH = 1
+SEASON_START_DAY   = 10
+
+def in_season():
+    today = datetime.date.today()
+    return today >= datetime.date(today.year, SEASON_START_MONTH, SEASON_START_DAY)
+
+def season_year():
+    return str(datetime.date.today().year)
+
+
+# =============================================================================
+# RFID USERS
+# -----------------------------------------------------------------------------
+# Add your RFID card numbers and names here.
+#
+# TO ADD A NEW PERSON:
+#   1. Scan their card — unknown tags are silently ignored
+#   2. Find their tag number in backup.csv
+#   3. Add their tag: "XXXXXXXXXX": "FirstName",
+#
+# TO REMOVE: Delete their line from USER_TAGS
+# =============================================================================
+
+USER_TAGS = {
+    # "0000000001": "Alice",
+    # "0000000002": "Bob",
+    # "0000000003": "Charlie",
+    # Add your cards here
+}
+
+# Special override card — scanning this clocks out ALL active users at once
+MASTER_TAG = "0000000000"   # Replace with your master card number
+
+# Official practice/work days — attendance tracked in season summary columns
+TRACKED_DAYS = {"Monday", "Tuesday", "Thursday", "Saturday"}
+
+
+# =============================================================================
+# GOOGLE SHEETS CONNECTION
+# -----------------------------------------------------------------------------
+# Requires credentials.json (Google service account key) in the project folder.
+# Share the sheet with your service account email address.
+#
+# Three tabs are managed automatically:
+#   "Log"         : Every clock-in and clock-out event
+#   "Live Status" : Who is currently clocked in right now
+#   "2026 Season" : One row per person for the season (auto-named by year)
+# =============================================================================
+
+SHEET_NAME = "RFID Log"   # Change this to match your Google Sheet name
+
+USE_SHEETS  = True
+sheet_log   = None
+sheet_live  = None
+sheet_summary = None
+
+try:
+    SCOPE = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    CREDS = Credentials.from_service_account_file("credentials.json", scopes=SCOPE)
+    client = gspread.authorize(CREDS)
+    workbook = client.open(SHEET_NAME)
+
+    # Tab 1: Log
+    try:
+        sheet_log = workbook.worksheet("Log")
+    except:
+        sheet_log = workbook.add_worksheet(title="Log", rows=5000, cols=10)
+        sheet_log.append_row(["User", "Date", "Day", "Clock In", "Clock Out", "Duration"])
+
+    # Tab 2: Live Status
+    try:
+        sheet_live = workbook.worksheet("Live Status")
+    except:
+        sheet_live = workbook.add_worksheet(title="Live Status", rows=100, cols=5)
+        sheet_live.append_row(["User", "Clocked In At", "Duration So Far", "Date", "Last Updated"])
+
+    # Tab 3: Season Summary (auto-named by year e.g. "2026 Season")
+    summary_tab_name = f"{season_year()} Season"
+    try:
+        sheet_summary = workbook.worksheet(summary_tab_name)
+    except:
+        sheet_summary = workbook.add_worksheet(title=summary_tab_name, rows=200, cols=10)
+        sheet_summary.append_row([
+            "User", "Mon", "Tue", "Thu", "Sat",
+            "Other Days", "Total Days", "Total Hours"
+        ])
+
+    print(f"✅ Google Sheets connected — summary tab: '{summary_tab_name}'")
+
+except Exception as e:
+    print("⚠️ Google Sheets disabled:", e)
+    USE_SHEETS = False
+
+
+# =============================================================================
+# LOCAL BACKUP
+# =============================================================================
+
+def log_local(user, action):
+    try:
+        with open("backup.csv", "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([user, action, datetime.datetime.now().isoformat()])
+    except Exception as e:
+        print("Local backup failed:", e)
+
+
+# =============================================================================
+# STATE
+# =============================================================================
+
+active_timers = {}   # {name: True} — who is currently clocked in
+daily_log     = {}   # {name_date: True} — prevents double clock-ins per day
+start_times   = {}   # {name: datetime} — for duration calculation
+terminal_log  = []   # Last 200 lines shown on web terminal
+sound_queue   = []   # Sounds to play: "in", "out", or "master"
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def today():
+    return datetime.date.today().isoformat()
+
+def today_display():
+    return datetime.date.today().strftime("%b %d")
+
+def timestamp():
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+def day_name():
+    return datetime.datetime.now().strftime("%A")
+
+def format_duration(seconds):
+    hours   = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h {minutes:02d}m"
+
+def add_duration_seconds(existing_str, new_seconds):
+    try:
+        parts = existing_str.replace("h", "").replace("m", "").split()
+        existing_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60
+    except:
+        existing_seconds = 0
+    return format_duration(existing_seconds + new_seconds)
+
+def add_log(message, sound=None):
+    line = f"[{timestamp()}] {message}"
+    terminal_log.append(line)
+    print(line)
+    if len(terminal_log) > 200:
+        terminal_log.pop(0)
+    if sound:
+        sound_queue.append(sound)
+
+
+# =============================================================================
+# CLOCK IN / CLOCK OUT
+# =============================================================================
+
+def clock_in(user):
+    key = f"{user}_{today()}"
+    if key in daily_log:
+        add_log(f"{user} already logged today — tap again to clock out")
+        return
+
+    active_timers[user] = True
+    start_times[user]   = datetime.datetime.now()
+    daily_log[key]      = True
+
+    log_local(user, "IN")
+    log_clockin_to_sheet(user)
+    update_live_status()
+    add_log(f"{user} — CLOCKED IN", sound="in")
+
+def clock_out(user):
+    if user not in active_timers:
+        return
+
+    duration_seconds = 0
+    if user in start_times:
+        duration_seconds = (datetime.datetime.now() - start_times[user]).total_seconds()
+        del start_times[user]
+
+    del active_timers[user]
+
+    log_local(user, "OUT")
+    log_clockout_to_sheet(user, duration_seconds)
+    update_season_summary(user, duration_seconds)
+    update_live_status()
+    add_log(f"{user} — CLOCKED OUT ({format_duration(duration_seconds)})", sound="out")
+
+def clock_out_all():
+    add_log("MASTER CARD — STOPPING ALL ACTIVE TIMERS", sound="master")
+    for u in list(active_timers.keys()):
+        clock_out(u)
+
+
+# =============================================================================
+# GOOGLE SHEETS — LOG TAB
+# =============================================================================
+
+def log_clockin_to_sheet(user):
+    if not USE_SHEETS or sheet_log is None:
+        return
+    try:
+        sheet_log.append_row([
+            user, today(), day_name(),
+            datetime.datetime.now().strftime("%H:%M:%S"), "", ""
+        ])
+    except Exception as e:
+        add_log(f"Sheet clock-in log failed: {e}")
+
+def log_clockout_to_sheet(user, duration_seconds):
+    if not USE_SHEETS or sheet_log is None:
+        return
+    try:
+        clock_out_time = datetime.datetime.now().strftime("%H:%M:%S")
+        duration_str   = format_duration(duration_seconds)
+        all_rows = sheet_log.get_all_values()
+        for i, row in enumerate(reversed(all_rows)):
+            row_index = len(all_rows) - i
+            if row[0] == user and row[1] == today() and len(row) >= 5 and row[4] == "":
+                sheet_log.update_cell(row_index, 5, clock_out_time)
+                sheet_log.update_cell(row_index, 6, duration_str)
+                return
+        sheet_log.append_row([user, today(), day_name(), "", clock_out_time, duration_str])
+    except Exception as e:
+        add_log(f"Sheet clock-out log failed: {e}")
+
+
+# =============================================================================
+# GOOGLE SHEETS — LIVE STATUS TAB
+# =============================================================================
+
+def update_live_status():
+    if not USE_SHEETS or sheet_live is None:
+        return
+    try:
+        sheet_live.resize(rows=1)
+        sheet_live.resize(rows=100)
+
+        now_dt  = datetime.datetime.now()
+        updated = now_dt.strftime("%H:%M:%S")
+
+        if not active_timers:
+            sheet_live.append_row(["— All clocked out —", "", "", today(), updated])
+            return
+
+        for user in active_timers:
+            clock_in_dt = start_times.get(user)
+            if clock_in_dt:
+                elapsed         = (now_dt - clock_in_dt).total_seconds()
+                duration_so_far = format_duration(elapsed)
+                clock_in_str    = clock_in_dt.strftime("%H:%M:%S")
+            else:
+                duration_so_far = ""
+                clock_in_str    = ""
+            sheet_live.append_row([user, clock_in_str, duration_so_far, today(), updated])
+
+    except Exception as e:
+        add_log(f"Live status update failed: {e}")
+
+
+# =============================================================================
+# GOOGLE SHEETS — SEASON SUMMARY TAB
+# =============================================================================
+
+def update_season_summary(user, duration_seconds):
+    if not USE_SHEETS or sheet_summary is None:
+        return
+    if not in_season():
+        add_log(f"Note: {user} clocked out before season start — not in season summary")
+        return
+
+    try:
+        day        = day_name()
+        date_label = today_display()
+        day_col    = {"Monday": 2, "Tuesday": 3, "Thursday": 4, "Saturday": 5}
+        all_rows   = sheet_summary.get_all_values()
+
+        found_row   = None
+        found_index = None
+        for i, row in enumerate(all_rows[1:], start=2):
+            if row[0] == user:
+                found_row   = row
+                found_index = i
+                break
+
+        if found_row is None:
+            new_row = [user, "", "", "", "", "", 1, format_duration(duration_seconds)]
+            if day in day_col:
+                new_row[day_col[day] - 1] = date_label
+            else:
+                new_row[5] = date_label
+            sheet_summary.append_row(new_row)
+        else:
+            if day in day_col:
+                col_idx        = day_col[day]
+                existing_dates = found_row[col_idx - 1] if len(found_row) >= col_idx else ""
+                updated_dates  = f"{existing_dates}, {date_label}".strip(", ") if existing_dates else date_label
+                sheet_summary.update_cell(found_index, col_idx, updated_dates)
+            else:
+                existing_other = found_row[5] if len(found_row) > 5 else ""
+                updated_other  = f"{existing_other}, {date_label}".strip(", ") if existing_other else date_label
+                sheet_summary.update_cell(found_index, 6, updated_other)
+
+            existing_days = int(found_row[6]) if len(found_row) > 6 and found_row[6].isdigit() else 0
+            sheet_summary.update_cell(found_index, 7, existing_days + 1)
+
+            existing_total = found_row[7] if len(found_row) > 7 else "0h 00m"
+            sheet_summary.update_cell(found_index, 8, add_duration_seconds(existing_total, duration_seconds))
+
+    except Exception as e:
+        add_log(f"Season summary update failed: {e}")
+
+
+# =============================================================================
+# MIDNIGHT AUTO-CLOCKOUT
+# =============================================================================
+
+def midnight_watcher():
+    while True:
+        now_dt        = datetime.datetime.now()
+        next_midnight = (now_dt + datetime.timedelta(days=1)).replace(
+            hour=0, minute=0, second=5, microsecond=0
+        )
+        time.sleep((next_midnight - now_dt).total_seconds())
+
+        if active_timers:
+            add_log("MIDNIGHT — Auto-clocking out all active timers", sound="master")
+            for u in list(active_timers.keys()):
+                clock_out(u)
+        else:
+            add_log("MIDNIGHT — No active timers")
+
+
+# =============================================================================
+# PROCESS TAG
+# =============================================================================
+
+def process_tag(tag):
+    tag = tag.strip()
+    if not tag:
+        return
+    if tag == MASTER_TAG:
+        clock_out_all()
+        return
+    if tag not in USER_TAGS:
+        return  # Unknown card — silently ignored
+    user = USER_TAGS[tag]
+    if user in active_timers:
+        clock_out(user)
+    else:
+        clock_in(user)
+
+
+# =============================================================================
+# WEB TERMINAL
+# =============================================================================
+
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RFID Terminal</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0a0a0a;
+            color: #00ff41;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 15px;
+            height: 100vh;
+            overflow: hidden;
+            cursor: none;
+        }
+        #header {
+            padding: 10px 16px;
+            border-bottom: 1px solid #1a1a1a;
+            color: #005f1a;
+            font-size: 12px;
+            letter-spacing: 2px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        #terminal {
+            padding: 16px;
+            height: calc(100vh - 42px);
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+        }
+        .line { padding: 2px 0; line-height: 1.6; opacity: 0; animation: fadein 0.3s forwards; }
+        .line.in     { color: #00ff41; }
+        .line.out    { color: #ff6b35; }
+        .line.error  { color: #ff2222; }
+        .line.master { color: #ffdd00; }
+        .line.info   { color: #444;    }
+        @keyframes fadein {
+            from { opacity: 0; transform: translateX(-4px); }
+            to   { opacity: 1; transform: translateX(0);    }
+        }
+        #hidden-input { position: fixed; top: -9999px; left: -9999px; opacity: 0; width: 1px; height: 1px; }
+        #cursor {
+            display: inline-block; width: 9px; height: 15px;
+            background: #00ff41; animation: blink 1s step-end infinite;
+            vertical-align: middle; margin-left: 4px;
+        }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+    </style>
+</head>
+<body>
+<div id="header">
+    <span>RFID TIME TRACKING SYSTEM</span>
+    <span id="clock"></span>
+</div>
+<div id="terminal">
+    <div id="log-lines"></div>
+    <div class="line info">— SYSTEM READY — SCAN CARD TO BEGIN <span id="cursor"></span></div>
+</div>
+<input id="hidden-input" type="text" autocomplete="off" />
+
+<script>
+    const input    = document.getElementById('hidden-input');
+    const logLines = document.getElementById('log-lines');
+    let buffer = '', lastLines = [];
+
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    let audioCtx = null;
+
+    function getAudioCtx() {
+        if (!audioCtx) audioCtx = new AudioContext();
+        return audioCtx;
+    }
+
+    function beep(freq, duration, volume = 0.3) {
+        try {
+            const ctx  = getAudioCtx();
+            const osc  = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.frequency.value = freq;
+            osc.type = 'sine';
+            gain.gain.setValueAtTime(volume, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration / 1000);
+            osc.start(ctx.currentTime);
+            osc.stop(ctx.currentTime + duration / 1000);
+        } catch(e) {}
+    }
+
+    function soundIn()     { beep(880, 120); setTimeout(() => beep(1100, 180), 130); }
+    function soundOut()    { beep(660, 120); setTimeout(() => beep(440,  200), 130); }
+    function soundMaster() { beep(550, 100); setTimeout(() => beep(550, 100), 120); setTimeout(() => beep(550, 200), 240); }
+
+    function playSound(type) {
+        if (type === 'in')     soundIn();
+        if (type === 'out')    soundOut();
+        if (type === 'master') soundMaster();
+    }
+
+    function keepFocus() { input.focus(); }
+    document.addEventListener('click', keepFocus);
+    document.addEventListener('keydown', keepFocus);
+    keepFocus();
+
+    function updateClock() {
+        document.getElementById('clock').textContent = new Date().toLocaleTimeString();
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+
+    input.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            const tag = buffer.trim();
+            buffer = ''; input.value = '';
+            if (tag) sendTag(tag);
+        } else {
+            buffer += e.key === 'Backspace' ? '' : (e.key.length === 1 ? e.key : '');
+        }
+    });
+
+    function sendTag(tag) {
+        fetch('/scan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tag: tag })
+        });
+    }
+
+    function pollLog() {
+        fetch('/log')
+            .then(r => r.json())
+            .then(data => {
+                const lines  = data.lines;
+                const sounds = data.sounds;
+
+                if (sounds && sounds.length > 0) sounds.forEach(s => playSound(s));
+
+                const changed = lines.length !== lastLines.length ||
+                                lines[lines.length-1] !== lastLines[lastLines.length-1];
+                if (changed) {
+                    renderLines(lines);
+                    lastLines = lines;
+                }
+            })
+            .catch(() => {})
+            .finally(() => setTimeout(pollLog, 500));
+    }
+
+    function renderLines(lines) {
+        logLines.innerHTML = '';
+        lines.forEach(line => {
+            const div = document.createElement('div');
+            div.className = 'line ' + getClass(line);
+            div.textContent = line;
+            logLines.appendChild(div);
+        });
+        logLines.scrollTop = logLines.scrollHeight;
+    }
+
+    function getClass(line) {
+        if (line.includes('CLOCKED IN'))                          return 'in';
+        if (line.includes('CLOCKED OUT'))                         return 'out';
+        if (line.includes('ERROR') || line.includes('UNKNOWN'))   return 'error';
+        if (line.includes('MASTER') || line.includes('MIDNIGHT')) return 'master';
+        return 'info';
+    }
+
+    pollLog();
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def terminal():
+    return render_template_string(HTML)
+
+@app.route("/scan", methods=["POST"])
+def scan():
+    data = request.get_json()
+    tag  = data.get("tag", "").strip()
+    threading.Thread(target=process_tag, args=(tag,)).start()
+    return jsonify({"ok": True})
+
+@app.route("/log")
+def log():
+    sounds = list(sound_queue)
+    sound_queue.clear()
+    return jsonify({"lines": terminal_log, "sounds": sounds})
+
+def run_web():
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+    app.run(host="0.0.0.0", port=5000, debug=False)
+
+
+# =============================================================================
+# START
+# =============================================================================
+
+add_log("System started — waiting for card scans")
+
+threading.Thread(target=run_web, daemon=True).start()
+threading.Thread(target=midnight_watcher, daemon=True).start()
+
+print("📡 Web terminal running at http://localhost:5000")
+print("   Open browser and scan cards through the page.")
+print("   Press CTRL+C to exit.")
+
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\n👋 Exiting RFID system...")
